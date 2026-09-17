@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <cerrno>
 #include <cstring>
 #include <iostream>
@@ -113,12 +111,6 @@ int main()
             _binary_nix_index_end
         );
 
-        /*
-         * They are now visible as:
-         *
-         *   /proc/self/fd/<locate_fd>
-         *   /proc/self/fd/<db_fd>
-         */
         std::string locate_path =
             "/proc/self/fd/" + std::to_string(locate_fd);
 

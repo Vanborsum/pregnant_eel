@@ -9,15 +9,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-extern char **environ;
-
 extern "C" {
-    // These come from linker-produced binary blobs.
-    extern const unsigned char _binary_nix_locate_start[];
-    extern const unsigned char _binary_nix_locate_end[];
+    extern const unsigned char _binary__run_current_system_sw_bin_nix_locate_start[];
+    extern const unsigned char _binary__run_current_system_sw_bin_nix_locate_end[];
 
-    extern const unsigned char _binary_nix_index_start[];
-    extern const unsigned char _binary_nix_index_end[];
+    extern const unsigned char _binary__home_brad__cache_nix_index_files_start[];
+    extern const unsigned char _binary__home_brad__cache_nix_index_files_end[];
 }
 
 static void write_all(int fd, const unsigned char* data, size_t size)
@@ -101,14 +98,14 @@ int main()
          */
         int locate_fd = blob_to_memfd(
             "embedded-nix-locate",
-            _binary_nix_locate_start,
-            _binary_nix_locate_end
+            _binary__run_current_system_sw_bin_nix_locate_start,
+            _binary__run_current_system_sw_bin_nix_locate_end
         );
 
         int db_fd = blob_to_memfd(
             "embedded-nix-index",
-            _binary_nix_index_start,
-            _binary_nix_index_end
+            _binary__home_brad__cache_nix_index_files_start,
+            _binary__home_brad__cache_nix_index_files_end
         );
 
         std::string locate_path =
@@ -125,17 +122,15 @@ int main()
          * We therefore make a tiny RAM-backed directory and make
          * "files" refer to our database memfd.
          */
-        char dir_template[] =
-            "/dev/shm/nixlocate-XXXXXX";
+        char db_dir_template[] =
+            "/dev/shm/nixlocate-database-XXXXXX";
 
-        char* db_dir_raw = mkdtemp(dir_template);
-
-        if (!db_dir_raw)
+        if (!mkdtemp(db_dir_template))
             throw std::runtime_error(
                 std::string("mkdtemp: ") + strerror(errno)
             );
 
-        std::string db_dir = db_dir_raw;
+        std::string db_dir = db_dir_template;
         std::string files_path = db_dir + "/files";
 
         if (symlink(db_path.c_str(), files_path.c_str()) == -1)
@@ -156,6 +151,7 @@ int main()
         /*
          * 3. Pipe allows us to capture nix-locate's stdout.
          */
+        // 0 is the write end, 1 is the read end
         int output[2];
 
         if (pipe(output) == -1)
@@ -170,11 +166,12 @@ int main()
             /*
              * CHILD
              */
-
+            // This thread is not the writer
             close(output[0]);
 
+            // Attach STDOUT onto the write end of the pipe
             dup2(output[1], STDOUT_FILENO);
-            close(output[1]);
+            close(output[1]); //both output[1] and STDOUT point to the same file so we can close one
 
             /*
              * Equivalent to:
@@ -187,6 +184,7 @@ int main()
                 const_cast<char*>("nix-locate"),
                 const_cast<char*>("--db"),
                 const_cast<char*>(db_dir.c_str()),
+                const_cast<char*>("-r"),
                 const_cast<char*>(pattern.c_str()),
                 nullptr
             };
@@ -194,12 +192,12 @@ int main()
             /*
              * Execute the embedded ELF through procfs.
              */
-            execve(
+            execv(
                 locate_path.c_str(),
-                argv,
-                environ
+                argv
             );
 
+            // execve failed, print an error and exit
             perror("execve");
             _exit(127);
         }

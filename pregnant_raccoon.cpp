@@ -1,4 +1,5 @@
-// Build with default.nix. Run as root with ubuntu-rootfs.tar beside the executable.
+// Build with build-static.sh. Run as root with deb-rootfs.tar beside the executable.
+// Ubuntu image packages for Snap checks: snapd, ca-certificates, squashfs-tools, squashfs-tools-ng.
 // Uses a trusted tarball and kernel; no host tar, mount, or chroot commands.
 
 #ifndef _GNU_SOURCE
@@ -26,17 +27,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <map>
-#include <fstream>
 #include <sstream>
 #include <sys/mman.h>
 #include <sys/sysmacros.h>
 
 namespace fs = std::filesystem;
-static size_t match_count = 0;
-static size_t different_count = 0;
-static size_t unresolved_count = 0;
-static size_t scan_error_count = 0;
-// Use the binary package version, including epoch and Ubuntu revision.
+// Use the binary package version, including the epoch and distribution revision.
 static const char* package_format = "${Package}:${Architecture}=${Version}\n";
 
 static void prepare_downloads(const std::string& root);
@@ -49,7 +45,8 @@ static std::string sha256_file(
 static std::string extract_reference(
     const std::string& root,
     const std::string& deb_path,
-    const std::string& elf_path);
+    const std::string& elf_path,
+    const std::string& scan_path);
 static std::string download_package(
     const std::string& root,
     const std::string& package,
@@ -193,20 +190,20 @@ static std::string mount_rootfs()
     if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) < 0)
         fail("make mounts private");
 
-    char parent[] = "/var/tmp/ubuntu-env-XXXXXX";
+    char parent[] = "/var/tmp/deb-env-XXXXXX";
     if (!mkdtemp(parent))
         fail("mkdtemp");
 
-    // make a root directory for the in-memory Ubuntu
+    // make a root directory for the in-memory Debian environment
     const std::string root = std::string(parent) + "/root";
 
     try {
         if (mkdir(root.c_str(), 0700) < 0)
             fail("mkdir mountpoint");
 
-        // Allow execution; ignore setuid bits and device nodes. Limit: 512 MiB.
+        // Allow execution; ignore setuid bits and device nodes. 1 GiB ceiling for the expanded Ubuntu image with snapd.
         if (mount("tmpfs", root.c_str(), "tmpfs", MS_NOSUID | MS_NODEV,
-                  "size=512M,mode=0755") < 0) {
+                  "size=1G,mode=0755") < 0) {
             fail("mount tmpfs");
         }
     } catch (...) {
@@ -523,6 +520,7 @@ static std::string query_owner(
         package_path = candidate;
         return selector;
     }
+    std::cout << path << " : Failure : No Corresponding Package Identified\n";
     throw std::runtime_error("No installed dpkg owner found");
 }
 
@@ -543,47 +541,22 @@ static void expose_host_dpkg(const std::string& root)
     }
 }
 
-// Read simple os-release fields as data; never source host configuration.
-static std::string os_release_field(const fs::path& file, const std::string& field)
+// Point the bundled Ubuntu archive entries at the selected US mirror.
+static void configure_ubuntu_mirror(const std::string& root)
 {
-    std::ifstream input(file);
-    if (!input)
-        throw std::runtime_error("Cannot read " + file.string());
-    std::string line;
-    while (std::getline(input, line)) {
-        if (line.rfind(field + "=", 0) != 0)
-            continue;
-        std::string value = line.substr(field.size() + 1);
-        if (value.size() >= 2 &&
-            ((value.front() == '"' && value.back() == '"') ||
-             (value.front() == '\'' && value.back() == '\''))) {
-            value = value.substr(1, value.size() - 2);
+    // Match an entire archive URI on an active source line. Preserve the
+    // suite, components, signing keys, and separate security archive.
+    const std::string rewrite =
+        R"(/^[[:space:]]*(URIs:|deb(-src)?[[:space:]])/)"
+        R"(s@([[:space:]])https?://(us\.)?archive\.ubuntu\.com/ubuntu/?([[:space:]]|$)@\1https://us.archive.ubuntu.com/ubuntu\3@g)";
+
+    for (const char* file : {"/etc/apt/sources.list.d/ubuntu.sources",
+                             "/etc/apt/sources.list"}) {
+        if (fs::is_regular_file(root + file) &&
+            run_in_rootfs(root, "/usr/bin/sed", {"-E", "-i", rewrite, file}) != 0) {
+            throw std::runtime_error(std::string("Cannot configure Ubuntu mirror in ") + file);
         }
-        return value;
     }
-    throw std::runtime_error("Missing " + field + " in " + file.string());
-}
-
-// Require an Ubuntu image matching the target's release and native architecture.
-// /usr/lib/os-release avoids an absolute /etc/os-release symlink escaping root.
-static void check_target(const std::string& root)
-{
-    const fs::path image = root + "/usr/lib/os-release";
-    if (os_release_field("/etc/os-release", "ID") != "ubuntu" ||
-        os_release_field(image, "ID") != "ubuntu" ||
-        os_release_field("/etc/os-release", "VERSION_ID") !=
-        os_release_field(image, "VERSION_ID")) {
-        throw std::runtime_error("Use an Ubuntu rootfs matching the target Ubuntu release");
-    }
-
-    const std::string host_arch = trim_newline(capture_command(root, "/usr/bin/dpkg-query", {
-        "--admindir=/host-dpkg", "--show", "--showformat=${Architecture}\n", "dpkg"
-    }));
-    const std::string image_arch = trim_newline(capture_command(root, "/usr/bin/dpkg", {
-        "--print-architecture"
-    }));
-    if (host_arch != image_arch)
-        throw std::runtime_error("Ubuntu rootfs architecture does not match target");
 }
 
 // Keep repository indexes and caches on disk too. Use only image repositories
@@ -654,10 +627,12 @@ static void scan_directory(
         return;
     }
 
+    if (directory == "/.snapshots")
+        return;
+
     struct stat directory_info {};
 
     if (lstat(directory.c_str(), &directory_info) < 0) {
-        ++scan_error_count;
         std::cerr << "Cannot inspect " << directory
                   << ": " << std::strerror(errno) << '\n';
         return;
@@ -678,7 +653,6 @@ static void scan_directory(
     const fs::directory_iterator end;
 
     if (error) {
-        ++scan_error_count;
         std::cerr << "Cannot scan " << directory
                   << ": " << error.message() << '\n';
         return;
@@ -689,7 +663,6 @@ static void scan_directory(
         const fs::file_status status = iterator->symlink_status(error);
 
         if (error) {
-            ++scan_error_count;
             std::cerr << "Cannot inspect " << path
                       << ": " << error.message() << '\n';
         }
@@ -705,7 +678,6 @@ static void scan_directory(
             );
 
             if (fd < 0) {
-                ++scan_error_count;
                 std::cerr << "Cannot open " << path
                           << ": " << std::strerror(errno) << '\n';
             }
@@ -716,7 +688,6 @@ static void scan_directory(
 
                 // Verify the opened object is still a regular file.
                 if (fstat(fd, &file_info) < 0) {
-                    ++scan_error_count;
                     std::cerr << "Cannot inspect opened file " << path
                               << ": " << std::strerror(errno) << '\n';
                 }
@@ -726,7 +697,6 @@ static void scan_directory(
                     } while (count < 0 && errno == EINTR);
 
                     if (count < 0) {
-                        ++scan_error_count;
                         std::cerr << "Cannot read " << path
                                   << ": " << std::strerror(errno) << '\n';
                     }
@@ -750,7 +720,6 @@ static void scan_directory(
         iterator.increment(error);
 
         if (error) {
-            ++scan_error_count;
             std::cerr << "Directory traversal failed in " << directory
                       << ": " << error.message() << '\n';
             break;
@@ -781,7 +750,8 @@ static std::string download_package(
         std::vector<std::string> args = apt_options();
         args.insert(args.end(), {"download", "--", package});
         if (run_in_rootfs(root, "/usr/bin/apt-get", args, -1, -1, inside) != 0) {
-            throw std::runtime_error("Cannot download exact version for " + path + ": " + package);
+            std::cout << path << " : Failure : Corresponding Package Failed to Download\n";
+            throw std::runtime_error("Exact package download failed: " + package);
         }
 
         std::string found;
@@ -799,7 +769,8 @@ static std::string download_package(
             std::string("--showformat=") + package_format, "--show", found
         }));
         if (actual != package)
-            throw std::runtime_error("Downloaded .deb identity does not match " + package);
+            throw std::runtime_error("Downloaded package identity does not match: requested [" +
+                                     package + "], received [" + actual + "]");
 
         cache[key] = found;
         return found;
@@ -872,11 +843,12 @@ static archive* open_deb_payload(const std::string& file, archive*& outer)
 
 // Carve only the requested regular file out of the .deb. Follow archive
 // hardlinks by their archive-root-relative names; never follow symlinks.
-// The temporary reference also lives on disk, and the caller must unlink it.
+// Write the reference to tmpfs and return its filename to the caller.
 static std::string extract_reference(
     const std::string& root,
     const std::string& deb_path,
-    const std::string& elf_path)
+    const std::string& elf_path,
+    const std::string& scan_path)
 {
     if (elf_path.empty() || elf_path[0] != '/')
         throw std::runtime_error("Expected an absolute package member path");
@@ -885,7 +857,7 @@ static std::string extract_reference(
     wanted = fs::path(wanted).lexically_normal().generic_string();
 
     std::set<std::string> visited;
-    fs::create_directories(root + "/downloads/reference");
+    fs::create_directories(root + "/reference");
 
     for (int depth = 0; depth < 32; ++depth) {
         if (!visited.insert(wanted).second)
@@ -916,7 +888,7 @@ static std::string extract_reference(
                 if (archive_entry_filetype(entry) != AE_IFREG || archive_entry_symlink(entry))
                     throw std::runtime_error("Reference member is not a regular file");
 
-                output_path = root + "/downloads/reference/elf-XXXXXX";
+                output_path = root + "/reference/elf-XXXXXX";
                 output_fd = mkstemp(output_path.data());
                 if (output_fd < 0)
                     fail("mkstemp reference");
@@ -932,8 +904,11 @@ static std::string extract_reference(
                 archive_read_free(outer);
                 return output_path;
             }
-            if (!follow_hardlink)
+            if (!follow_hardlink) {
+                // Existing consumers expect this exact legacy status line.
+                std::cout << scan_path << " : Failure : Binary Could Not be Parsed From rpm Archive\n";
                 throw std::runtime_error("ELF path is absent from the .deb payload: " + elf_path);
+            }
         } catch (...) {
             if (output_fd >= 0) close(output_fd);
             if (!output_path.empty()) unlink(output_path.c_str());
@@ -1001,6 +976,260 @@ static std::string sha256_file(
     return digest;
 }
 
+// Extract printable ASCII strings from a regular file.
+// Like strings -a with a minimum length of 4; does not decode UTF-16/UTF-32.
+static std::vector<std::string> extract_strings(const std::string& path)
+{
+    constexpr size_t minimum_length = 4;
+
+    int fd = open(
+        path.c_str(),
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+    );
+
+    if (fd < 0)
+        fail("open " + path);
+
+    std::vector<std::string> strings;
+    std::string current;
+
+    try {
+        struct stat before {}, after {};
+
+        if (fstat(fd, &before) < 0)
+            fail("fstat");
+
+        if (!S_ISREG(before.st_mode))
+            throw std::runtime_error("Target is no longer a regular file");
+
+        unsigned char buffer[64 * 1024];
+
+        for (;;) {
+            ssize_t count = read(fd, buffer, sizeof(buffer));
+
+            if (count < 0) {
+                if (errno == EINTR)
+                    continue;
+
+                fail("read " + path);
+            }
+
+            if (count == 0)
+                break;
+
+            for (ssize_t i = 0; i < count; ++i) {
+                const unsigned char byte = buffer[i];
+
+                const bool printable =
+                    (byte >= 0x20 && byte <= 0x7e) || byte == '\t';
+
+                if (printable) {
+                    current.push_back(static_cast<char>(byte));
+                }
+                else {
+                    if (current.size() >= minimum_length)
+                        strings.push_back(current);
+
+                    current.clear();
+                }
+            }
+        }
+
+        // Include a final string even when the file ends without a delimiter.
+        if (current.size() >= minimum_length)
+            strings.push_back(current);
+
+        if (fstat(fd, &after) < 0)
+            fail("fstat");
+
+        if (before.st_size != after.st_size ||
+            before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+            before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
+            before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+            before.st_ctim.tv_nsec != after.st_ctim.tv_nsec) {
+            throw std::runtime_error(
+                "Target changed while extracting strings"
+            );
+        }
+    } catch (...) {
+        close(fd);
+        throw;
+    }
+
+    close(fd);
+    return strings;
+}
+
+// Multiply the fraction of strings found in each direction, counting repeated entries.
+static float score_string_overlap(
+    const std::vector<std::string>& reference_strings,
+    const std::vector<std::string>& actual_strings)
+{
+    if (reference_strings.empty())
+        return 0.0f;
+    if (actual_strings.empty())
+        return 0.0f;
+
+    float first_percentage = 0.0;
+    float second_percentage = 0.0;
+    float numerator = 0.0;
+    float denominator = 0.0;
+
+    for (const std::string& s : reference_strings)
+    {
+        int found = 0;
+        for (const std::string& candidate : actual_strings)
+        {
+            if (candidate == s)
+            {
+                found = 1;
+                break;
+            }
+        }
+        if (found) numerator += 1.0;
+        denominator += 1.0;
+    }
+
+    first_percentage = numerator / denominator;
+    numerator = 0.0;
+    denominator = 0.0;
+
+    for (const std::string& s : actual_strings)
+    {
+        int found = 0;
+        for (const std::string& candidate : reference_strings)
+        {
+            if (candidate == s)
+            {
+                found = 1;
+                break;
+            }
+        }
+        if (found) numerator += 1.0;
+        denominator += 1.0;
+    }
+
+    second_percentage = numerator / denominator;
+    return first_percentage * second_percentage;
+}
+
+// Split /snap/<store-name>[_<instance>]/<store-revision>/<member>.
+// Parallel instances share the same Store archive for a given revision.
+static void parse_snap_path(
+    const std::string& path,
+    std::string& name,
+    std::string& revision,
+    std::string& member)
+{
+    const size_t name_end = path.find('/', 6);
+    if (name_end == std::string::npos || path.compare(0, 6, "/snap/") != 0)
+        throw std::runtime_error("Expected /snap/<name>/<revision>/<file>");
+    const size_t revision_end = path.find('/', name_end + 1);
+    if (revision_end == std::string::npos || revision_end + 1 == path.size())
+        throw std::runtime_error("Expected /snap/<name>/<revision>/<file>");
+
+    const std::string instance = path.substr(6, name_end - 6);
+    const size_t split = instance.find('_');
+    name = instance.substr(0, split);
+    const std::string letters = "abcdefghijklmnopqrstuvwxyz";
+    const std::string alnum = letters + "0123456789";
+    if (name.size() < 2 || name.size() > 40 || name.front() == '-' || name.back() == '-' ||
+        name.find_first_of(letters) == std::string::npos ||
+        name.find_first_not_of(alnum + "-") != std::string::npos ||
+        name.find("--") != std::string::npos)
+        throw std::runtime_error("Invalid Snap Store name");
+
+    if (split != std::string::npos) {
+        const std::string key = instance.substr(split + 1);
+        if (key.empty() || key.size() > 10 || key.find_first_not_of(alnum) != std::string::npos)
+            throw std::runtime_error("Invalid Snap instance key");
+    }
+
+    revision = path.substr(name_end + 1, revision_end - name_end - 1);
+    if (revision.empty() || revision.front() == '0' ||
+        revision.find_first_not_of("0123456789") != std::string::npos)
+        throw std::runtime_error("Expected a numeric Store revision (local snaps and components are unsupported)");
+
+    member = path.substr(revision_end + 1);
+    check_archive_path(member.c_str());
+}
+
+// Fetch once per (name, revision) into the private disk cache. The trusted
+// client's download command fetches and verifies the Store assertions itself.
+// Its default filenames identify the returned name and revision. Accept only
+// the expected pair in our fresh directory. Never install or execute the snap.
+static std::string download_snap(const std::string& root, const std::string& name,
+                                 const std::string& revision)
+{
+    static std::map<std::string, std::string> archives;
+    static std::map<std::string, std::string> failures;
+    const std::string stem = name + "_" + revision;
+    const std::string key = root + "/" + stem;
+    if (archives.count(key))
+        return archives.at(key);
+    if (failures.count(key))
+        throw std::runtime_error(failures.at(key));
+
+    std::string directory = root + "/downloads/snap-XXXXXX";
+    if (!mkdtemp(directory.data()))
+        fail("mkdtemp snap download");
+
+    try {
+        for (const char* program : {"/usr/bin/snap", "/usr/bin/unsquashfs", "/usr/bin/rdsquashfs"}) {
+            if (access((root + program).c_str(), X_OK) < 0)
+                throw std::runtime_error(std::string("Missing Snap tool in deb-rootfs.tar: ") + program);
+        }
+
+        const std::string inside = "/downloads/" + fs::path(directory).filename().string();
+        if (run_in_rootfs(root, "/usr/bin/snap",
+                          {"download", "--revision=" + revision, name}, -1, -1, inside) != 0)
+            throw std::runtime_error("Snap Store download or assertion verification failed for " + stem);
+
+        for (const char* ext : {".snap", ".assert"}) {
+            const fs::path file = fs::path(directory) / (stem + ext);
+            if (!fs::is_regular_file(fs::symlink_status(file)) || fs::file_size(file) == 0)
+                throw std::runtime_error("Missing exact verified Snap download: " + stem + ext);
+        }
+        const std::string archive = inside + "/" + stem + ".snap";
+        archives[key] = archive;
+        return archive;
+    } catch (const std::exception& error) {
+        std::error_code ignored;
+        fs::remove_all(directory, ignored);
+        failures[key] = error.what();
+        throw;
+    }
+}
+
+// Read one literal regular-file member from the authenticated SquashFS.
+// Keep even large reference binaries on disk. check_elf removes this copy.
+static std::string extract_snap_reference(const std::string& root, const std::string& path)
+{
+    std::string name, revision, member;
+    parse_snap_path(path, name, revision, member);
+    const std::string archive = download_snap(root, name, revision);
+    std::string reference = root + "/downloads/snap-elf-XXXXXX";
+    const int fd = mkostemp(reference.data(), O_CLOEXEC);
+    if (fd < 0)
+        fail("mkostemp snap reference");
+
+    try {
+        if (run_in_rootfs(root, "/usr/bin/rdsquashfs", {"--cat", "/" + member, archive}, fd) != 0)
+            throw std::runtime_error("Cannot extract regular file from verified snap: " + member);
+    } catch (...) {
+        close(fd);
+        unlink(reference.c_str());
+        throw;
+    }
+    if (close(fd) < 0) {
+        const int error = errno;
+        unlink(reference.c_str());
+        errno = error;
+        fail("close snap reference");
+    }
+    return reference;
+}
+
 // Look up, download, and compare one detected ELF.
 // A failed lookup/download is unresolved, not a hash mismatch.
 static void check_elf(
@@ -1008,36 +1237,37 @@ static void check_elf(
     const std::string& path)
 {
     try {
-        std::string package_path;
-        const std::string package = query_owner(root, path, package_path);
-        const std::string deb_path = download_package(root, package, path);
-        const std::string reference = extract_reference(root, deb_path, package_path);
-        std::string expected;
+        std::string reference;
+        if (path.compare(0, 6, "/snap/") == 0) {
+            reference = extract_snap_reference(root, path);
+        } else {
+            std::string package_path;
+            const std::string package = query_owner(root, path, package_path);
+            const std::string deb_path = download_package(root, package, path);
+            reference = extract_reference(root, deb_path, package_path, path);
+        }
 
         try {
-            expected = sha256_file(root, reference);
-        }
-        catch (...) {
+            const std::string expected = sha256_file(root, reference);
+            const std::string actual = sha256_file(root, path);
+
+            if (actual == expected) {
+                std::cout << path << " : Success : Hash Match\n";
+            }
+            else {
+                const auto reference_strings = extract_strings(reference);
+                const auto actual_strings = extract_strings(path);
+                const float score = score_string_overlap(reference_strings, actual_strings);
+
+                std::cout << path << " : Check Required : String Comparison : " << score << "\n";
+            }
+        } catch (...) {
             unlink(reference.c_str());
             throw;
         }
 
         unlink(reference.c_str());
-
-        const std::string actual = sha256_file(root, path);
-
-        if (actual == expected)
-            ++match_count;
-        else
-            ++different_count;
-
-        std::cout << (actual == expected ? "MATCH " : "DIFFERENT ")
-                  << path << '\n'
-                  << "  package:  " << package << '\n'
-                  << "  expected: " << expected << '\n'
-                  << "  actual:   " << actual << '\n';
     } catch (const std::exception& error) {
-        ++unresolved_count;
         std::cerr << "UNRESOLVED " << path
                   << ": " << error.what() << '\n';
     }
@@ -1075,16 +1305,37 @@ static void prepare_downloads(const std::string& root)
          std::vector<std::pair<const char*, unsigned int>>{
              {"null", 3}, {"zero", 5}, {"random", 8}, {"urandom", 9}
          }) {
-        const std::string path = root + "/dev/" + device.first;
+        // Bind the kernel device by descriptor after checking its major/minor.
+        const std::string path = std::string("/dev/") + device.first;
+        const std::string target = root + path;
+        const int placeholder = open(target.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+        if (placeholder < 0)
+            fail("create " + target);
+        close(placeholder);
 
-        if (mknod(path.c_str(), S_IFCHR | 0666,
-                  makedev(1, device.second)) < 0) {
-            fail("mknod " + path);
+        const int fd = open(path.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0)
+            fail("open " + path);
+
+        try {
+            struct stat info {};
+            if (fstat(fd, &info) < 0)
+                fail("fstat " + path);
+            if (!S_ISCHR(info.st_mode) || info.st_rdev != makedev(1, device.second))
+                throw std::runtime_error("Unexpected device at " + path);
+
+            const std::string source = "/proc/self/fd/" + std::to_string(fd);
+            if (mount(source.c_str(), target.c_str(), nullptr, MS_BIND, nullptr) < 0)
+                fail("bind " + path);
+        } catch (...) {
+            close(fd);
+            throw;
         }
+        close(fd);
     }
 }
 
-int main(int argc, char** argv)
+int main()
 {
     std::string root;
     int exit_code = 1;
@@ -1093,16 +1344,10 @@ int main(int argc, char** argv)
         if (geteuid() != 0)
             throw std::runtime_error("Run as root (sudo)");
 
-        if (argc > 2)
-            throw std::runtime_error("Usage: pregnant_frog [directory-to-scan]");
-        const fs::path scan_path = argc == 2 ? fs::canonical(argv[1]) : fs::path("/");
-        if (!fs::is_directory(scan_path))
-            throw std::runtime_error("Scan path must be a directory");
-
-        // Find ubuntu-rootfs.tar beside this executable.
+        // Find deb-rootfs.tar beside this executable.
         const fs::path executable = fs::read_symlink("/proc/self/exe");
         const fs::path tar_path =
-            executable.parent_path() / "ubuntu-rootfs.tar";
+            executable.parent_path() / "deb-rootfs.tar";
 
         // Create and populate the trusted environment.
         root = mount_rootfs();
@@ -1110,20 +1355,31 @@ int main(int argc, char** argv)
 
         // Expose the host database and prepare package downloads.
         expose_host_dpkg(root);
-        check_target(root);
         prepare_downloads(root);
+
+        std::cerr << "Bundled OS:\n"
+                  << capture_command(
+                         root, "/usr/bin/cat", {"/etc/os-release"}
+                     );
+
+        configure_ubuntu_mirror(root);
         refresh_repositories(root);
+
+        // Show the configured repositories and the available libinput build.
+        std::vector<std::string> args = apt_options();
+        args.push_back("policy");
+        run_in_rootfs(root, "/usr/bin/apt-cache", args);
+        args.push_back("libinput10");
+        run_in_rootfs(root, "/usr/bin/apt-cache", args);
 
         // Scan the host filesystem. Each detected ELF goes to check_elf().
         std::set<std::pair<dev_t, ino_t>> visited;
-        scan_directory(root, scan_path, visited);
+        // Prefer the canonical Snap path if a revision is also bind-mounted elsewhere.
+        if (fs::is_directory(fs::symlink_status("/snap")))
+            scan_directory(root, "/snap", visited);
+        scan_directory(root, "/", visited);
 
-        std::cout << "Summary: " << match_count << " MATCH, "
-                  << different_count << " DIFFERENT, "
-                  << unresolved_count << " UNRESOLVED, "
-                  << scan_error_count << " scan errors\n";
-        // 0 = all checked files match; 2 = mismatch; 3 = incomplete scan.
-        exit_code = unresolved_count || scan_error_count ? 3 : (different_count ? 2 : 0);
+        exit_code = 0;
     }
     catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
